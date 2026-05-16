@@ -164,6 +164,154 @@ func TestAssembleResults(t *testing.T) {
 	}
 }
 
+func TestAssembleResultsWithSharedHostNetwork(t *testing.T) {
+	podDefinitions := []struct {
+		name      string
+		namespace string
+		ip        string
+		port      int32
+	}{
+		// Pods sharing IPv4 address
+		{"node-exporter", "openshift-monitoring", "10.0.1.100", 9100},
+		{"kube-proxy", "openshift-network", "10.0.1.100", 10256},
+		{"crio", "openshift-node", "10.0.1.100", 9537},
+		// Pods sharing IPv6 address
+		{"kubelet", "openshift-node", "2001:db8::1", 10250},
+		{"ovn-controller", "openshift-ovn-kubernetes", "2001:db8::1", 29102},
+	}
+
+	var batch []portScanResult
+	for _, def := range podDefinitions {
+		pod := makePod(def.name, def.namespace, def.ip, def.port)
+		batch = append(batch, portScanResult{
+			ip:     def.ip,
+			pod:    pod,
+			result: PortResult{Port: int(def.port), Status: StatusOK},
+		})
+	}
+
+	expectedPods := make(map[string]struct {
+		ip   string
+		port int
+	})
+	for _, def := range podDefinitions {
+		expectedPods[def.namespace+"/"+def.name] = struct {
+			ip   string
+			port int
+		}{def.ip, int(def.port)}
+	}
+
+	results := assembleResults(time.Now(), 0, nil, batch)
+
+	// ScannedIPs should count unique IPs (2: one IPv4, one IPv6)
+	if results.ScannedIPs != 2 {
+		t.Errorf("expected 2 unique scanned IPs, got %d", results.ScannedIPs)
+	}
+
+	// IPResults should have separate entries for each pod
+	if len(results.IPResults) != len(podDefinitions) {
+		t.Errorf("expected %d IPResults (one per pod), got %d", len(podDefinitions), len(results.IPResults))
+	}
+
+	for _, ir := range results.IPResults {
+		if ir.Pod == nil {
+			t.Errorf("unable to find Pod entry for %#v entry", ir)
+			continue
+		}
+		key := ir.Pod.Namespace + "/" + ir.Pod.Name
+		expected, ok := expectedPods[key]
+		if !ok {
+			t.Errorf("unexpected IPResult for pod %s", key)
+			continue
+		}
+		if ir.IP != expected.ip {
+			t.Errorf("%s: expected IP %s, got %s", ir.Pod.Name, expected.ip, ir.IP)
+		}
+		if len(ir.PortResults) != 1 || ir.PortResults[0].Port != expected.port {
+			t.Errorf("%s: expected port %d, got %v", ir.Pod.Name, expected.port, ir.PortResults)
+		}
+		delete(expectedPods, key)
+	}
+
+	for key := range expectedPods {
+		t.Errorf("missing IPResult for pod %s", key)
+	}
+}
+
+func TestDeduplicateScanJobs(t *testing.T) {
+	const (
+		sharedIP = "10.0.1.100"
+		port     = 9100
+	)
+
+	// Pod that declares the port in its spec
+	podWithSpec := makePod("node-exporter", "openshift-monitoring", sharedIP, port)
+
+	// Pod that doesn't declare the port (discovered via /proc)
+	podWithoutSpec := makePod("hostnetwork-pod", "openshift-node", sharedIP)
+
+	// Another pod that also declares the port
+	podAlsoWithSpec := makePod("another-exporter", "openshift-monitoring", sharedIP, port)
+
+	tests := []struct {
+		name     string
+		jobs     []ScanJob
+		expected int
+		wantPod  string
+	}{
+		{
+			name: "no duplicates",
+			jobs: []ScanJob{
+				{IP: "10.0.0.1", Port: 443, Pod: podWithSpec},
+				{IP: "10.0.0.2", Port: 443, Pod: podWithoutSpec},
+			},
+			expected: 2,
+			wantPod:  "",
+		},
+		{
+			name: "duplicate: pod with spec wins over pod without spec",
+			jobs: []ScanJob{
+				{IP: sharedIP, Port: port, Pod: podWithoutSpec},
+				{IP: sharedIP, Port: port, Pod: podWithSpec},
+			},
+			expected: 1,
+			wantPod:  "node-exporter",
+		},
+		{
+			name: "duplicate: both pods declare port, first wins",
+			jobs: []ScanJob{
+				{IP: sharedIP, Port: port, Pod: podWithSpec},
+				{IP: sharedIP, Port: port, Pod: podAlsoWithSpec},
+			},
+			expected: 1,
+			wantPod:  "node-exporter",
+		},
+		{
+			name: "duplicate: pod without spec first, then pod with spec replaces it",
+			jobs: []ScanJob{
+				{IP: sharedIP, Port: port, Pod: podWithoutSpec},
+				{IP: sharedIP, Port: port, Pod: podWithSpec},
+			},
+			expected: 1,
+			wantPod:  "node-exporter",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := deduplicateScanJobs(tt.jobs)
+			if len(result) != tt.expected {
+				t.Errorf("expected %d jobs after dedup, got %d", tt.expected, len(result))
+			}
+			if tt.wantPod != "" && len(result) > 0 {
+				if result[0].Pod.Name != tt.wantPod {
+					t.Errorf("expected pod %s to be selected, got %s", tt.wantPod, result[0].Pod.Name)
+				}
+			}
+		})
+	}
+}
+
 func TestGetMinVersionValue(t *testing.T) {
 	t.Parallel()
 
