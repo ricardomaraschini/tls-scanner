@@ -449,10 +449,17 @@ func batchScan(jobs []ScanJob, concurrentScans int, client *k8s.Client, tlsConfi
 
 func assembleResults(startTime time.Time, totalIPs int, tlsConfig *k8s.TLSSecurityProfile, portResults ...[]portScanResult) ScanResults {
 	ipResultMap := make(map[string]*IPResult)
+	uniqueIPs := make(map[string]bool)
 
 	for _, batch := range portResults {
 		for _, r := range batch {
-			ir, ok := ipResultMap[r.ip]
+			// Pods sharing the same hosted network have the same IP.
+			// Include the pod namespace and name to make the key unique
+			// for ports. Use bracket notation to avoid ambiguity with IPv6
+			// addresses (which contain colons).
+			key := fmt.Sprintf("[%s]:%s/%s", r.ip, r.pod.Namespace, r.pod.Name)
+
+			ir, ok := ipResultMap[key]
 			if !ok {
 				ir = &IPResult{
 					IP:                 r.ip,
@@ -465,7 +472,7 @@ func assembleResults(startTime time.Time, totalIPs int, tlsConfig *k8s.TLSSecuri
 					pod := r.pod
 					ir.Pod = &pod
 				}
-				ipResultMap[r.ip] = ir
+				ipResultMap[key] = ir
 			}
 			if r.result.Port > 0 {
 				found := false
@@ -480,6 +487,7 @@ func assembleResults(startTime time.Time, totalIPs int, tlsConfig *k8s.TLSSecuri
 				}
 			}
 			ir.PortResults = append(ir.PortResults, r.result)
+			uniqueIPs[r.ip] = true
 		}
 	}
 
@@ -492,10 +500,10 @@ func assembleResults(startTime time.Time, totalIPs int, tlsConfig *k8s.TLSSecuri
 		TotalIPs:          totalIPs,
 		IPResults:         make([]IPResult, 0, len(ipResultMap)),
 		TLSSecurityConfig: tlsConfig,
+		ScannedIPs:        len(uniqueIPs),
 	}
 	for _, ir := range ipResultMap {
 		results.IPResults = append(results.IPResults, *ir)
-		results.ScannedIPs++
 	}
 
 	return results
@@ -546,16 +554,56 @@ func filterByProcessPorts(processMap map[string]map[int]string, procPorts []int)
 }
 
 func deduplicateScanJobs(jobs []ScanJob) []ScanJob {
-	seen := make(map[string]bool, len(jobs))
+	keyIndex := make(map[string]int)
 	var unique []ScanJob
+
+	specPortsCache := make(map[string]map[int]bool)
+	getSpecPorts := func(pod k8s.PodInfo) map[int]bool {
+		key := pod.Namespace + "/" + pod.Name
+		if ports, ok := specPortsCache[key]; ok {
+			return ports
+		}
+		portList, _ := k8s.DiscoverPortsFromPodSpec(pod.Pod)
+		portSet := make(map[int]bool, len(portList))
+		for _, p := range portList {
+			portSet[p] = true
+		}
+		specPortsCache[key] = portSet
+		return portSet
+	}
+
 	for _, job := range jobs {
 		key := targetKey(job.IP, strconv.Itoa(job.Port))
-		if seen[key] {
+		idx, exists := keyIndex[key]
+
+		if !exists {
+			keyIndex[key] = len(unique)
+			unique = append(unique, job)
 			continue
 		}
-		seen[key] = true
-		unique = append(unique, job)
+
+		// Select the first pod that specifies the port in its spec (if there's any)
+		// to find the owning pod. Pods sharing the same host network see the same
+		// list of ports which makes the ownership ambiguous.
+		jobDeclares := getSpecPorts(job.Pod)[job.Port]
+		existingDeclares := getSpecPorts(unique[idx].Pod)[unique[idx].Port]
+
+		if jobDeclares && existingDeclares {
+			slog.Debug("duplicate target: both pods declare port, keeping first",
+				"target", key,
+				"kept", unique[idx].Pod.Namespace+"/"+unique[idx].Pod.Name,
+				"skipped", job.Pod.Namespace+"/"+job.Pod.Name,
+				"port", job.Port)
+		} else if jobDeclares && !existingDeclares {
+			slog.Debug("duplicate target: replacing with pod that declares port",
+				"target", key,
+				"replaced", unique[idx].Pod.Namespace+"/"+unique[idx].Pod.Name,
+				"with", job.Pod.Namespace+"/"+job.Pod.Name,
+				"port", job.Port)
+			unique[idx] = job
+		}
 	}
+
 	return unique
 }
 
