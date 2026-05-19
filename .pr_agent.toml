@@ -1,8 +1,6 @@
 [github_app]
 feedback_or_draft_pr = false
-handle_push_trigger = true
 pr_commands = ["/agentic_review"]
-push_commands = ["/agentic_review"]
 
 [auto_best_practices]
 enable_auto_best_practices = true
